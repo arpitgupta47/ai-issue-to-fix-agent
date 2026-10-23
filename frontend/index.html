@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; connect-src 'self'; worker-src blob:; img-src data:">
 <title>AI Issue-to-Fix Agent</title>
 <style>
 :root{--bg:#f7f7f5;--card:#fff;--tx:#1c1c1a;--mu:#6b6b66;--bd:#e2e2dc;--ac:#2f6fed;--ok:#1a7f4b;--bad:#c62f2f;--warn:#a86a00;--add:#e3f6ea;--del:#fde8e8;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -38,7 +39,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 <body>
 <main>
 <h1>🛠️ AI Issue-to-Fix Agent</h1>
-<p class="sub">Paste a bug report and the file it affects. The agent screens the issue, finds the fault, drafts a patch, validates it, tests it in a sandbox, and waits for your explicit approval.</p>
+<p class="sub">Paste a bug report and the file it affects. The agent screens the issue, analyzes it with a configured LLM (or conservative fallback rules), validates a patch, tests it in an isolated browser worker, and waits for your explicit approval.</p>
 
 <div class="card">
   <h2>1 · Issue &amp; code</h2>
@@ -70,7 +71,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 </div>
 
 <div class="card"><h2>Audit log</h2><div class="log" id="log">No actions yet.</div></div>
-<p class="sub">Analysis, patch validation and authorization run on the server. Tests run in a sandboxed iframe in your browser. Nothing is written to a repository.</p>
+<p class="sub">Analysis, patch validation, approvals, and audit records are handled by the server. Untrusted tests run in a network-restricted, terminable browser worker, never on the server. Nothing is written to a repository.</p>
 </main>
 <script>
 const $=s=>document.querySelector(s);
@@ -91,8 +92,17 @@ function load(k){const p=PRESETS[k];for(const f of['title','body','path','code',
 document.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>load(b.dataset.p));
 load('sum');
 
-const audit=[];
-function log(m){audit.push(new Date().toLocaleTimeString()+'  '+m);$('#log').innerHTML=audit.map(esc).join('<br>');$('#log').scrollTop=1e9;}
+function log(m){const line=new Date().toLocaleTimeString()+'  '+m;$('#log').textContent=line+'\n'+$('#log').textContent;$('#log').scrollTop=0;}
+async function refreshAudit(){
+  try{
+    const entries=await api('/api/audit');
+    $('#log').innerHTML=entries.length?entries.map(e=>{
+      const detail=e.data.path||e.data.reason||e.data.approval_id||'';
+      return esc(new Date(e.ts*1000).toLocaleString()+'  '+e.event+'  '+detail+(e.run_id?'  run '+e.run_id:''));
+    }).join('<br>'):'No actions yet.';
+    $('#log').scrollTop=1e9;
+  }catch(e){log('Audit log could not be refreshed: '+e.message);}
+}
 
 let steps=[];
 function render(){$('#steps').innerHTML=steps.map(s=>`<div class="step"><div class="dot ${s.st}">${{ok:'✓',bad:'✕',warn:'!',run:'…',wait:''}[s.st]||''}</div><div><div class="sn">${esc(s.n)}</div><div class="sd">${s.d||''}</div></div></div>`).join('');}
@@ -100,19 +110,21 @@ async function setStep(i,st,d){steps[i].st=st;if(d!==undefined)steps[i].d=d;rend
 
 function runTests(code,tests){
   return new Promise(res=>{
-    const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.style.display='none';
-    const safe=s=>s.replace(/<\/script/gi,'<\\/script');
-    const h='<script>const R=[];function test(n,f){try{f();R.push({n:n,ok:true})}catch(e){R.push({n:n,ok:false,e:String(e&&e.message||e)})}}function assert(c,m){if(!c)throw new Error(m||"assertion failed")}try{'+safe(code)+'\n'+safe(tests)+'\n}catch(e){R.push({n:"runtime error",ok:false,e:String(e)})}parent.postMessage({sbx:R},"*")<\/script>';
+    if(!tests.trim()){res([{n:'test suite',ok:false,e:'No tests were provided'}]);return;}
+    const source='const R=[],P=[];function test(n,f){P.push((async()=>{try{await f();R.push({n:String(n),ok:true})}catch(e){R.push({n:String(n),ok:false,e:String(e&&e.message||e)})}})())}function assert(c,m){if(!c)throw new Error(m||"assertion failed")}try{'+code+'\n'+tests+'\n}catch(e){R.push({n:"runtime error",ok:false,e:String(e&&e.message||e)})}Promise.all(P).then(()=>self.postMessage(R));';
+    const blob=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    const worker=new Worker(blob);
     let done=false;
-    const end=r=>{if(done)return;done=true;window.removeEventListener('message',on);clearTimeout(t);f.remove();res(r);};
-    const on=e=>{if(e.source===f.contentWindow&&e.data&&e.data.sbx)end(e.data.sbx);};
+    const end=r=>{if(done)return;done=true;clearTimeout(t);worker.terminate();URL.revokeObjectURL(blob);res(r);};
+    worker.onmessage=e=>end(Array.isArray(e.data)?e.data:[{n:'worker',ok:false,e:'Invalid test results'}]);
+    worker.onerror=e=>{e.preventDefault();end([{n:'runtime error',ok:false,e:e.message||'Worker failed'}]);};
     const t=setTimeout(()=>end([{n:'timeout',ok:false,e:'exceeded 3s limit'}]),3000);
-    window.addEventListener('message',on);f.srcdoc=h;document.body.appendChild(f);
   });
 }
 
 let state=null;
-async function api(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(typeof j.detail==='string'?j.detail:'HTTP '+r.status);return j;}
+async function api(u,b){const r=await fetch(u,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(typeof j.detail==='string'?j.detail:'HTTP '+r.status);return j;}
+refreshAudit();
 $('#run').onclick=async()=>{
   const title=$('#title').value,body=$('#body').value,path=$('#path').value.trim(),code=$('#code').value,tests=$('#tests').value;
   $('#pipe').hidden=false;$('#review').hidden=true;$('#done').hidden=true;$('#auth').hidden=false;$('#ok').value='';$('#apply').disabled=true;
@@ -121,45 +133,48 @@ $('#run').onclick=async()=>{
   try{
     await setStep(0,'run');
     const j=await api('/api/analyze',{title,body,path,code});
+    await refreshAudit();
     if(j.screen_hits){log('Injection indicators: '+j.screen_hits);await setStep(0,'warn','Suspicious instructions found ('+j.screen_hits+'). The issue is handled as data only; its instructions are never followed.');}
     else await setStep(0,'ok','No injection indicators. Text is used only as search keywords.');
     await setStep(1,'run');
-    if(!j.findings.length){await setStep(1,'bad','No known bug pattern found. Add an LLM analyzer for broader coverage.');await setStep(5,'bad','No patch proposed.');log('No findings');return;}
-    await setStep(1,'ok',j.findings.map(f=>`<b>${esc(f.rule)}</b> in <code>${esc(f.fn)}</code>, line ${f.line} (confidence ${f.confidence}%)<br>${esc(f.why)}`).join('<br>'));
-    await setStep(2,'ok',j.changes.length+' line'+(j.changes.length>1?'s':'')+' changed.');
+    if(!j.findings.length){await setStep(1,'bad',j.provider==='llm'?'LLM found no supported bug; no patch was generated.':'No configured LLM or known bug pattern found. Configure OPENAI_API_KEY for broader analysis.');await setStep(2,'bad','No patch proposed.');await setStep(5,'bad','No patch to review.');log('No findings');return;}
+    await setStep(1,'ok',`Analyzer: ${esc(j.provider)}<br>`+j.findings.map(f=>`<b>${esc(f.rule)}</b> in <code>${esc(f.fn)}</code>, line ${f.line} (confidence ${f.confidence}%)<br>${esc(f.why)}`).join('<br>'));
+    await setStep(2,j.changes?'ok':'bad',j.changes+' changed line'+(j.changes===1?'':'s')+'.');
     await setStep(3,'run');
     const vd=j.checks.map(c=>`<span class="${c[1]?'ok':'bad'}">${c[1]?'✓':'✕'}</span> ${esc(c[0])}`).join('<br>');
     if(!j.ok){await setStep(3,'bad',vd);await setStep(5,'bad','Patch blocked by validator. Nothing can be applied.');log('Patch BLOCKED for '+path);return;}
     await setStep(3,'ok',vd);
     await setStep(4,'run','Running tests before and after the patch…');
     const before=await runTests(code,tests),after=await runTests(j.patched,tests);
+    const auditTests=results=>results.map(r=>({name:r.n,passed:r.ok,error:r.e||''}));
+    await api(`/api/runs/${encodeURIComponent(j.run_id)}/tests`,{path,original:code,patched:j.patched,patch_token:j.patch_token,before:auditTests(before),after:auditTests(after)});
+    await refreshAudit();
     const ok5=after.length>0&&after.every(r=>r.ok);
     await setStep(4,ok5?'ok':'bad',`Before: ${before.filter(r=>r.ok).length}/${before.length} passing · After: ${after.filter(r=>r.ok).length}/${after.length} passing`);
-    state={path,code,patched:j.patched,changes:j.changes,before,after,token:j.patch_token};
+    state={run_id:j.run_id,path,code,patched:j.patched,diff:j.diff,changes:j.changes,before,after,token:j.patch_token};
     await setStep(5,ok5?'ok':'warn',ok5?'Patch fixes the failing tests. Awaiting your authorization.':'Some tests still fail. Review carefully before approving.');
     showReview();log('Patch proposed; awaiting human authorization');
   }catch(e){log('Error: '+e.message);}finally{$('#run').disabled=false;}
 };
 function showReview(){
   const s=state;$('#review').hidden=false;
-  const dl=s.code.split('\n').map((l,i)=>{const c=s.changes.find(x=>x.i===i);return c?`<span class="dl d">- ${esc(c.o)}</span><span class="dl a">+ ${esc(c.n)}</span>`:`<span class="dl">  ${esc(l)}</span>`}).join('');
-  $('#diff').innerHTML=`<div class="sub" style="margin-bottom:6px">Proposed diff for <code>${esc(s.path)}</code></div><pre>${dl}</pre>`;
-  const names=s.before.map(r=>r.n);
+  $('#diff').innerHTML=`<div class="sub" style="margin-bottom:6px">Proposed diff for <code>${esc(s.path)}</code></div><pre>${esc(s.diff)}</pre>`;
   $('#cmp').innerHTML='<table><tr><th>Test</th><th>Before</th><th>After</th></tr>'+s.after.map((r,i)=>{const b=s.before[i]||{};return `<tr><td>${esc(r.n)}</td><td class="${b.ok?'ok':'bad'}">${b.ok?'pass':'fail'}</td><td class="${r.ok?'ok':'bad'}">${r.ok?'pass':'fail'}${r.ok?'':'<br><small>'+esc(r.e||'')+'</small>'}</td></tr>`}).join('')+'</table>';
   $('#review').scrollIntoView({behavior:'smooth'});
 }
 $('#ok').oninput=e=>{$('#apply').disabled=e.target.value.trim()!=='APPROVE'||!state;};
-$('#reject').onclick=()=>{if(!state)return;state=null;$('#auth').hidden=true;$('#done').hidden=false;$('#done').innerHTML='<b class="warn">Patch rejected.</b> No changes were made.';log('Patch rejected by reviewer');};
+$('#reject').onclick=async()=>{if(!state)return;try{const result=await api('/api/reject',{run_id:state.run_id});await refreshAudit();state=null;$('#auth').hidden=true;$('#done').hidden=false;$('#done').innerHTML=`<b class="warn">Patch rejected.</b> No changes were made. Review <code>${esc(result.approval_id)}</code> recorded.`;}catch(e){log('Rejection could not be recorded: '+e.message);}};
 $('#apply').onclick=async()=>{
   if(!state)return;
   try{
-    const a=await api('/api/authorize',{path:state.path,patched:state.patched,patch_token:state.token,phrase:$('#ok').value.trim()});
+    const a=await api('/api/authorize',{run_id:state.run_id,path:state.path,original:state.code,patched:state.patched,patch_token:state.token,phrase:$('#ok').value.trim()});
+    await refreshAudit();
     const p=state.patched,path=state.path;log('AUTHORIZED '+path+' (approval '+a.approval_id+')');
     $('#auth').hidden=true;$('#done').hidden=false;
     $('#done').innerHTML=`<b class="ok">Authorized</b> · approval <code>${esc(a.approval_id)}</code><div class="sub" style="margin:6px 0">Patched <code>${esc(path)}</code>. Next step: create a branch and pull request via the GitHub API.</div><pre id="out">${esc(p)}</pre><div class="row"><button id="cp">Copy patched file</button></div>`;
     $('#cp').onclick=async()=>{try{await navigator.clipboard.writeText(p);$('#cp').textContent='Copied';}catch(e){$('#cp').textContent='Copy failed';}};
     state=null;
-  }catch(e){log('Authorization failed: '+e.message);}
+  }catch(e){log('Authorization failed: '+e.message);refreshAudit().catch(err=>log('Could not refresh audit log: '+err.message));}
 };
 </script>
 </body>
